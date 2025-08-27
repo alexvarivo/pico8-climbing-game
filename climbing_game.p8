@@ -1,0 +1,939 @@
+pico-8 cartridge // http://www.pico-8.com
+version 42
+__lua__
+-- globals + config
+
+-- physics
+g=0.22
+air_acc=0.08
+ground_acc=0.15
+fric=0.85
+max_vx=1.4
+max_air_vx=1.0
+jump_v=-3.6
+double_jump_v=-3.4
+dash_v=3.0
+dash_time=10
+hold_r=6.2
+spawn_gap_min=14
+spawn_gap_max=22
+spawn_x_min=8
+spawn_x_max=120
+
+-- lives
+lives_max=3
+lives=lives_max
+life_msg_t=0
+life_msg=""
+shake_t=0
+life_msg_dur=60  -- ~1s at _update60
+
+-- wall band (middle 2/3)
+wall_x1=3
+wall_x2=12
+wall_px1=wall_x1*8
+wall_px2=(wall_x2+1)*8-1
+
+-- darker edge width
+edge_w=16
+
+-- colors
+sky_col=12   -- light blue
+rock_col=6   -- brownish
+edge_col=5   -- darker edge
+sun_col=10   -- yellow
+cloud_col=7  -- white
+
+outline_cache={}
+
+-- spawn holds inside the wall band
+spawn_x_min=wall_px1+6
+spawn_x_max=wall_px2-6
+
+-- game state
+state="title"
+cam_y=0
+score=0
+best=0
+char_i=1
+char_defs={}
+for i=1,9 do
+ add(char_defs,{spr=i,name="c"..i})
+end
+holds={}
+player=nil
+next_spawn_y=nil
+
+-- helpers
+function rndr(a,b) return a+rnd(b-a) end
+function sgn(x) return (x<0) and -1 or 1 end
+function clamp(x,a,b)
+ if x<a then return a end
+ if x>b then return b end
+ return x
+end
+
+function btnp_any(...)
+ for i=1,select('#', ...) do
+  local b=select(i, ...)
+  if btnp(b) then return true end
+ end
+ return false
+end
+
+function cam_shake()
+ if shake_t>0 then
+  return flr(rnd(3))-1, flr(rnd(3))-1
+ end
+ return 0,0
+end
+-->8
+-- objects + spawning
+
+function make_player(x,y,spr)
+ return {
+  x=x, y=y, w=6, h=6,
+  vx=0, vy=0,
+  spr=spr,
+  on_hold=false, hold_id=nil,
+  jumps_left=2,
+  dashed=false, dash_t=0,
+  coyote=0, jbuf=0
+ }
+end
+
+function spawn_hold(y)
+ local x=flr(rndr(spawn_x_min,spawn_x_max))
+ local spr=flr(rndr(32,48))
+ add(holds,{x=x,y=y,spr=spr,r=hold_r,id=stat(8)})
+end
+
+function ensure_spawns_up_to(target_y)
+ while next_spawn_y>target_y-96 do
+  spawn_hold(next_spawn_y)
+  next_spawn_y-=flr(rndr(spawn_gap_min,spawn_gap_max))
+ end
+end
+
+function lose_life()
+ lives-=1
+ life_msg="-1 life"
+ life_msg_t=life_msg_dur
+ shake_t=20
+ reset_level()
+end
+
+function reset_level()
+ srand(time())
+ holds={}
+ cam_y=0
+ score=0
+ local y=64
+ for i=1,8 do
+  spawn_hold(y)
+  y-=18
+ end
+ next_spawn_y=y
+ local h=holds[1]
+ player=make_player(h.x,h.y-10,char_defs[char_i].spr)
+ player.on_hold=true
+ player.hold_id=1
+end
+-->8
+-- player input + physics
+
+function input_player(p)
+ local l=btn(0) and -1 or 0
+ local r=btn(1) and 1 or 0
+ local dir=l+r
+ local a=p.on_hold and ground_acc or air_acc
+ p.vx+=dir*a
+ local cap=p.on_hold and max_vx or max_air_vx
+ p.vx=mid(-cap,p.vx,cap)
+ if dir==0 then p.vx*=fric end
+
+ if btnp(5) then p.jbuf=6 end
+ if p.coyote>0 and p.jbuf>0 then do_jump(p,false) end
+ if p.jumps_left>0 and (btnp(5) or (p.jbuf>0 and not p.on_hold)) then
+  do_jump(p,true)
+ end
+
+ if not p.dashed and btnp(4) then
+  local d=dir
+  if d==0 then d=(p.vx==0) and 1 or sgn(p.vx) end
+  start_dash(p,d)
+ end
+end
+
+function do_jump(p,is_air)
+ if p.on_hold then
+  p.on_hold=false
+  p.hold_id=nil
+  p.vy=jump_v
+  p.jumps_left=1
+  p.coyote=0
+  p.jbuf=0
+  return
+ end
+ if is_air and p.jumps_left>0 then
+  p.vy=double_jump_v
+  p.jumps_left-=1
+  p.jbuf=0
+ end
+end
+
+function start_dash(p,dir)
+ p.dashed=true
+ p.dash_t=dash_time
+ p.vx=dir*dash_v
+ p.vy*=0.25
+end
+-->8
+-- update loop
+
+function update_player(p)
+ -- timers
+	if life_msg_t>0 then life_msg_t-=1 end
+	if shake_t>0 then shake_t-=1 end
+
+ if p.coyote>0 then p.coyote-=1 end
+ if p.jbuf>0 then p.jbuf-=1 end
+ if p.dash_t>0 then p.dash_t-=1 else p.vy+=g end
+
+ input_player(p)
+
+ local px,py=p.x,p.y
+ p.x+=p.vx
+ p.y+=p.vy
+ p.x=clamp(p.x,2,124)
+
+ local bx,by=p.x,p.y+p.h*0.5
+ if p.vy>=0 then
+  local grab_id=nil
+  for i=#holds,1,-1 do
+   local h=holds[i]
+   if abs(h.y-by)<10 and abs(h.x-bx)<12 then
+    local dx=bx-h.x
+    local dy=by-h.y
+    if dx*dx+dy*dy <= (h.r*h.r) then grab_id=i break end
+   end
+  end
+  if grab_id then
+   p.on_hold=true
+   p.hold_id=grab_id
+   p.y=holds[grab_id].y-p.h*0.5
+   p.vy=0 p.vx*=0.5
+   p.jumps_left=2 p.dashed=false p.dash_t=0
+  elseif py<p.y and p.on_hold then
+   p.coyote=6 p.on_hold=false p.hold_id=nil
+  end
+ else
+  p.on_hold=false p.hold_id=nil
+ end
+
+ cam_y=min(cam_y, p.y-48)
+ if p.y<score then score=p.y end
+
+ local lim=cam_y+140
+ for i=#holds,1,-1 do
+  if holds[i].y>lim then deli(holds,i) end
+ end
+ ensure_spawns_up_to(p.y-48)
+end
+-->8
+-- drawing
+
+-- sky (screen space)
+function draw_sky_screen()
+  rectfill(0,0,127,127,sky_col)
+
+  -- sun
+  circfill(112,16,10,sun_col)
+  circ(112,16,10,7)
+
+  -- cloud rows acros
+		local rows={}
+		local y_start=14
+		local y_step=28 
+		for y=y_start,120,y_step do
+		  add(rows,y)
+		end
+
+  local t=time()
+
+  -- left of wall
+  clip(0,0,wall_px1-1,128)
+  for r=1,#rows do
+    draw_cloud_row(rows[r], 8+2*r, 32, r*13, t, r)
+  end
+  -- right of wall
+  clip(wall_px2+1,0,128-(wall_px2+1),128)
+  for r=1,#rows do
+    draw_cloud_row(rows[r], 8+2*r, 32, r*13, t, r)
+  end
+  clip()
+end
+
+-- small deterministic hash
+local function h01(k)
+  return abs(sin(k*1.2345+6.789))
+end
+local function hrange(k,a,b)
+  return a + (b-a)*h01(k)
+end
+local function hirange(k,a,b)
+  return flr(hrange(k,a,b+1))
+end
+
+-- draw one row of drifting clouds (varied shapes)
+function draw_cloud_row(y,speed,spacing,phase,t,ri)
+  local w=128+32
+  for i=0,7 do
+    local x=((i*spacing + t*speed + phase) % w) - 16
+    local seed= ri*997 + i*37 + y*11 -- r = row index
+    draw_cloud(x,y,seed)
+  end
+end
+
+-- varied cloud
+function draw_cloud(x,y,seed)
+  local puffs = 3 + hirange(seed+2,0,3) -- 3 to 6 puffs
+  local width = hrange(seed+3,10,22) -- total span
+  local lift  = hrange(seed+4,-1,2)  -- slight vertical bias
+
+  -- "type" switch for variety
+  local kind = hirange(seed+5,0,2)
+  for j=1,puffs do
+    local t=j/(puffs+1)
+    local jitterx = hrange(seed+10*j,-2,2)
+    local jittery = hrange(seed+20*j,-2,2)
+
+    local px=x + (t-0.5)*width + jitterx
+    local py=y + lift + jittery
+
+    local r = hrange(seed+30*j,3,6)
+    if kind==1 and j%2==0 then r+=1 end -- some puffier
+    if kind==2 then py+= (j- (puffs/2))*0.4 end -- slope
+
+    circfill(px,py,r,cloud_col)
+  end
+end
+
+-- wall (world space / scrolls)
+-- wobble for wall edges
+function wob(y, phase)
+  local t = y*0.008
+  return sin(t*0.7 + phase)*3 + sin(t*0.21 + phase*1.9)*2
+end
+
+-- colors
+function wall_cell_color(cx, cy, xc, wl, wr)
+  -- base noise (0 to 15)
+  local m = bxor(cx*13, cy*17) % 16
+
+  -- edge factor (0 far from edge, 1 at edge)
+  local dx   = min(abs(xc-wl), abs(wr-xc))
+  local edge = max(0, min(1, (edge_w - dx) / edge_w))
+
+  -- darker near edges
+  if edge > 0 then
+    local spice = (bxor(cx*31, cy*57) % 3) 
+    m = min(15, m + flr(edge * 5) + spice)
+  end
+
+  local near_rim = edge > 0.9
+
+  -- map bins
+  if m < 10 then
+    return 6 -- light gray
+  elseif m < 14 then
+    return 5 -- dark gray
+  elseif m < 15 then
+    return 4 -- brown
+  else
+    return 5 -- black (at rim)
+  end
+end
+
+
+function draw_wall_world()
+  local cell=5     
+  local y0=flr(cam_y)-cell
+  local y1=y0+128+cell
+  local cx=(wall_px1+wall_px2)/2
+  local hw=(wall_px2-wall_px1)/2
+
+  for y=y0,y1,cell do
+    -- compute wobbly edges
+    local ymid=y+cell/2
+    local wl=flr(cx - hw + wob(ymid,0.0))
+    local wr=flr(cx + hw + wob(ymid,0.6))
+
+    -- align cell grid
+    local xl=flr(wl/cell)*cell
+    local xr=flr(wr/cell)*cell
+
+    -- fill across band
+    for x=xl,xr,cell do
+      local cx_i=flr(x/cell)
+      local cy_i=flr(y/cell)
+      local xc=x+cell/2
+      local col=wall_cell_color(cx_i,cy_i,xc,wl,wr)
+
+      -- light per-color texture
+      if col==6 then
+        fillp() -- light gray solid
+      elseif col==5 then
+        fillp(0b1100110011001100,true) -- speckle
+      elseif col==4 then
+        fillp(0b1111000011110000,true)
+      else
+        fillp() -- black solid
+      end
+
+      -- clamp cell to current wobbly edges
+      local x1=max(x,wl)
+      local x2=min(x+cell-1,wr)
+      if x1<=x2 then rectfill(x1,y,x2,y+cell-1,col) end
+    end
+
+    -- reset pattern
+    fillp()
+
+    -- 2px darker band (around edges)
+    fillp(0b1100110011001100,true)
+    rectfill(wl-1, y, wl,    y+cell-1, 5)  -- left edge band (dark gray)
+    rectfill(wr,   y, wr+1,  y+cell-1, 5)  -- right edge band (dark gray)
+    fillp()
+  end
+end
+
+
+-- 1px outline mask around non-transparent pixels of sprite
+function build_outline_pts(n)
+  if outline_cache[n] then return outline_cache[n] end
+  local sx=(n%16)*8
+  local sy=flr(n/16)*8
+  local seen={}
+  local pts={}
+  for i=0,7 do
+    for j=0,7 do
+      if sget(sx+i,sy+j)~=0 then
+        for dx=-1,1 do
+          for dy=-1,1 do
+            if dx~=0 or dy~=0 then
+              local px=i+dx
+              local py=j+dy
+              local key=px*100+py -- hash
+              if not seen[key] then
+                seen[key]=true
+                add(pts,{px,py})
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  outline_cache[n]=pts
+  return pts
+end
+
+-- sprite with black outline
+function spr_with_outline(n,x,y)
+  local pts=build_outline_pts(n)
+  -- black outline
+  for p in all(pts) do
+    pset(x+p[1], y+p[2], 9) -- 0 = black
+  end
+  -- actual sprite
+  spr(n,x,y)
+end
+
+-- outlined holds
+function draw_holds()
+  for h in all(holds) do
+    spr_with_outline(h.spr, h.x-4, h.y-4)
+  end
+end
+
+function draw_player(p)
+ spr(p.spr, p.x-4, p.y-4)
+ if p.dash_t>0 then
+  circfill(p.x-2*sgn(p.vx), p.y, 2, 7)
+ end
+end
+
+function draw_ui()
+ local sc=-flr(score)
+ print("best:"..best,2,2,11)
+ print("score:"..sc,2,10,14)
+
+ -- lives 
+ local heart_spr=48
+ local x=118
+ for i=1,lives do
+  spr(heart_spr,x-(i-1)*10,2)
+ end
+ 
+ -- life lost popup
+	if life_msg_t>0 then
+	 local y=36
+	 local c=8 -- red
+	 print_center(life_msg,y+1,0,0) -- shadow
+	 print_center(life_msg,y,c,c)
+	end
+end
+
+-- draw sprite scaled
+function spr_scaled(n,x,y,w,h,scale)
+  local sx=(n%16)*8
+  local sy=flr(n/16)*8
+  sspr(sx,sy,8*w,8*h, x,y, 8*w*scale, 8*h*scale)
+end
+
+-- 5x6 blocky font for letters
+local glyph={
+ c={0b01110,0b10001,0b10000,0b10000,0b10001,0b01110},
+ l={0b10000,0b10000,0b10000,0b10000,0b10000,0b11111},
+ i={0b11111,0b00100,0b00100,0b00100,0b00100,0b11111},
+ m={0b10001,0b11011,0b10101,0b10001,0b10001,0b10001},
+ b={0b11110,0b10001,0b11110,0b10001,0b10001,0b11110},
+ o={0b01110,0b10001,0b10001,0b10001,0b10001,0b01110},
+ n={0b10001,0b11001,0b10101,0b10011,0b10001,0b10001},
+}
+
+local function draw_big_char(ch,x,y,sc,fill,outline)
+  local rows=glyph[ch]
+  if not rows then return end
+  for ry=1,6 do
+    local row=rows[ry]
+    for rx=0,4 do
+      if band(row, shl(1,4-rx))~=0 then
+        -- outline
+        if outline then
+          rectfill(x+rx*sc-1,y+(ry-1)*sc-1, x+rx*sc+sc, y+(ry-1)*sc+sc, outline)
+        end
+        -- fill
+        rectfill(x+rx*sc,y+(ry-1)*sc, x+rx*sc+sc-1,y+(ry-1)*sc+sc-1, fill)
+      end
+    end
+  end
+end
+
+local function measure_big_text(s,sc)
+  local w=0
+  for i=1,#s do
+    local ch=sub(s,i,i)
+    if ch==" " then
+      w+=4*sc -- space width
+    else
+      w+=6*sc -- 5px glyph + 1px spacing
+    end
+  end
+  return max(0,w-(1*sc)) -- trim trailing spacing
+end
+
+function draw_big_text_center(s,y,sc,fill,outline)
+  local w=measure_big_text(s,sc)
+  local x=64-flr(w/2)
+  for i=1,#s do
+    local ch=sub(s,i,i)
+    if ch==" " then
+      x+=4*sc
+    else
+      draw_big_char(ch,x,y,sc,fill,outline)
+      x+=6*sc
+    end
+  end
+end
+
+function draw_title()
+ cls(sky_col)
+ 
+ -- sun sprite
+ spr_scaled(50,64-16,4,2,2,2)
+ 
+ -- title
+ draw_big_text_center("climb", 45, 3, 7, 0) -- white with black outline
+ draw_big_text_center("on",    69, 3, 7, 0)
+   
+ print_center("arrows: move",94,6,6)
+ print_center("x: jump / double jump",102,6,6)
+ print_center("c: dash (in arrow dir)",110,6,6)
+ print_center("press x to start",120,10,11)
+end
+
+function draw_select()
+ cls(0)
+ print_center("choose your climber",18,10,7)
+ local cx=64
+ spr(char_defs[char_i].spr,cx-4,46)
+ for i=-3,3 do
+  local idx=((char_i+i-1)%9)+1
+  spr(char_defs[idx].spr, cx-4+i*12, 72)
+ end
+ print_center("left/right to pick",92,6,6)
+ print_center("x to begin",102,10,11)
+end
+
+function print_center(t,y,sh,c)
+ local w=#t*4
+ print(t,64-w/2+1,y+1,0)
+ print(t,64-w/2,y, c or 7)
+end
+
+-- text that uniformly pulses wider/narrower
+function draw_pulse_text(s, y, col, shadow_col)
+  local t=time()
+  local pulse=1+0.10*sin(t*0.9) -- 1.0 +- 0.10
+  local char_w=4
+  local spacing=char_w*pulse
+  local w=#s*spacing
+  local x0=64-w/2     -- line centered
+  local dy=sin(t*1.2)*1 -- bounce
+  for i=1,#s do
+    local ch=sub(s,i,i)
+    local x=x0+(i-1)*spacing
+    print(ch, x+1, y+dy+1, shadow_col or 0)
+    print(ch, x,   y+dy,   col or 11)
+  end
+end
+
+function draw_hospital()
+  camera()
+  cls(7) -- room base
+
+  -- floor
+  rectfill(0,96,127,127,4)
+  line(0,96,127,96,13)
+
+  -- window + curtains
+  local wx1,wy1,wx2,wy2=6,10,54,36
+  rectfill(wx1,wy1,wx2,wy2,12)  rect(wx1,wy1,wx2,wy2,5)
+  circfill(wx2-8, wy1+6, 5, 10)
+  line(wx1-2, wy1-3, wx2+2, wy1-3, 5)
+  fillp(0b1111000011110000,true)
+  rectfill(wx1-2, wy1-2, wx1+4, wy2+2, 14)
+  rectfill(wx2-4, wy1-2, wx2+2, wy2+2, 14)
+  fillp()
+
+  -- hospital cross
+  spr_scaled(10, 82, 4, 1, 1, 3)
+		
+		-- heart break
+		local ht_s = 2		
+		local ht_x = 19
+		local ht_y = 40
+		spr_scaled(53,ht_x,ht_y,2,2,ht_s)
+		
+		-- x-ray sign
+		local xr_s = 1
+		local xr_x = 68
+		local xr_y = 35 
+		spr_scaled(57, xr_x, xr_y, 7, 2, xr_s)
+		
+		-- x-ray scan
+		local xray_s = 2 -- scale
+		local xray_w, xray_h = 2, 2 -- size
+		
+		local xray_x = 79
+		local xray_y = 55
+		
+		spr_scaled(55, xray_x, xray_y, xray_w, xray_h, xray_s)
+		
+		-- bed 
+		local bed_s = 3 -- scale
+		local bed_w, bed_h = 2, 2 -- size 
+		local floor_y = 104
+		
+		-- left position
+		local bed_x = 10
+		-- bottom-align to floor
+		local bed_y = floor_y - (8*bed_h*bed_s) + 1
+	
+		spr_scaled(13, bed_x, bed_y, bed_w, bed_h, bed_s)
+
+  -- text
+  print_center("acl tear. surgery time:(", 102, 0, 8)
+		draw_pulse_text("press x to play again", 116, 11, 0)
+end
+
+
+-->8
+-- main loop
+
+local function start_game()
+ lives=lives_max
+ reset_level()
+ state="game"
+end
+
+function _init()
+ state="title"
+ reset_level()
+end
+
+function _update60()
+ if state=="title" then
+  if btnp(5) then state="select" end
+
+ elseif state=="select" then
+  if btnp(0) then char_i=(char_i-2)%9+1 end
+  if btnp(1) then char_i=(char_i)%9+1 end
+  if btnp(5) then start_game() end
+
+ elseif state=="game" then
+  update_player(player)
+
+  -- fell off bottom
+  if player.y > cam_y + 140 then
+   if lives>1 then
+    lose_life() -- lose life, keep playing
+   else
+   	lives=0
+    best=max(best,-flr(score)) -- keep best score
+    state="hospital"
+   end
+  end
+
+ elseif state=="hospital" then
+  -- press x or c to restart with 3 new lives
+  if btnp_any(5,4) then
+   start_game()
+  end
+  
+ elseif state=="hospital" then
+ 	camera()-- no scrolling
+ 	draw_hospital() -- new scene
+	end
+end
+
+function _draw()
+ if state=="title" then
+  draw_title()
+  
+ elseif state=="select" then
+  draw_select()
+  
+ elseif state=="game" then
+ 	-- sky stays fixed to screen
+  camera()
+  draw_sky_screen()
+  
+  -- world (scrolls with camera + shake)
+		local sx,sy=cam_shake()
+  camera(sx,cam_y+sy)
+  draw_wall_world()
+  draw_holds()
+  draw_player(player)
+
+  -- ui 
+  camera()
+  draw_ui()
+
+	elseif state=="hospital" then
+  camera() -- no scrolling
+  draw_hospital() -- new scene
+
+ elseif state=="gameover" then
+  camera()
+  draw_sky_screen()
+  local sx,sy=cam_shake()
+  camera(sx,cam_y+sy)
+  draw_wall_world()
+  draw_holds()
+  draw_player(player)
+  camera()
+  draw_ui()
+  -- gameover panel
+  rectfill(10,44,118,84,0)
+  rect(10,44,118,84,7)
+  print_center("you fell!",54,10,8)
+  print_center("out of lives",62,10,8)
+  print_center("score: "..(-flr(score)),70,10,7)
+  print_center("best: "..best,78,10,6)
+  print_center("x or c to retry",92,10,11)  
+ end
+end
+__gfx__
+0000000000000000606ddd06044444400aaaaaa0004444000eeeeee00b7bbba00003b3b00ccccc100066660000aacccccccccc00000000000000000000000000
+000000000066660060dddd0644fff444aafffaaa04444440eee444ee55553330000c13100cddddc0006bb6000aa0ac0c00c00c0c000000000000000000000000
+0070070000716100ddd7d7dd041f1f440a1f1faa041717400e4141e0001f1f30000333aa0d1ff1d0666bb6660aa0ac0c0c0c0c00000000000000000000000000
+00077000007799900d75757000ffff4400ffffaa00ffff00ee44440000ffff000dd777000dddddd06bbbbbb60ca0cc050c0c0c0c500000000000000000000000
+000770000067880007ffff700fbbbbf40fccbbfa099dd990e4aa994007eeee706766d440a222222a6bbbbbb600c00c0705cc0c00500000000000000000000000
+0070070076788800fd8888dfffbbbbf00fccbbfa0f9999f0e4aa99440f2222f0066d44200cccccc0666bb666cccccb5775ccccb7500000000000000000000000
+000000000779970000d88d0000ccccf00f8899f00099990004cc110000b33b00002442000fccccf0006bb60053ccc577775ccb57566600000000000500000000
+000000000090090000f00f000420024000200200008008000080020000f00f00000909000a0000a00066660075bc3577775cc5dd5666ccccccccccc500000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000753c5776675b35dd5666ccccccccccc500000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d75357666775b5dd5666ccccccccccc500000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ddd5000660005ddd555555555555555500000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ddd0060060605ddd500005000050000500000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ddd00600606065dd500055555555000500000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000dd560006606065dd000000000000000000000000
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d56666666666665d000000000000000000000000
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000005666666666666665000000000000000000000000
+0000000000000000000000000000f000000000000000100000000000000000000000330000000000000000000000000000000000000000000000000000007000
+0000b72000002000000000000005ff0000077d00000a11000000ee000000a000033333000000e000000f4f00000020000000ddd00001000000000d6000722000
+007bb7700002210000080000005eeed000017000000111a000eeeef000d3aaa00333b000000eee00088f480000025200000dbddb81111000000dddd007722770
+088777a000ee22000038300000ffeed0007777000111110000eeeee0003d33d00833b30000ee1ee0088ffff00029229000ddddbb888111f000dd8dd807272270
+087777aa0eeee2100388830000ffff00001777000011111000efeef00003d3300033b8000001eee0000fff4000222252000bdbb0088111f0006ddd8002772220
+0277bb7000ee22200838830000f55ff000d7d700000a11100000ee0000a333a03333b83000031e1e00ffff00000222220000bd0000111ff00008dd0000272220
+00bbb20000222100080883000000ed00007770000000101000000f0000daaa000000830000013e00004ff880000922200000000000111f000000060000002200
+000b200000000200000030000000000000010000000000000000000000000a000000000000011000000088800005200000000000000000000000000000000000
+0000000000000000a00a000aa000a00a000000000000000000000000666666666666666688888888888888888888888888888888888888888888888888888000
+00000000000000000a000aaaaaa000a000000000000000000000000065551111c111155686666666666666666666666666666666666666666666666666668000
+0088088000000000000aaaaaaaaaa00000000000001110000111000065551111cc11155686bb66666666bb66666666bb6666666666bbb66666b6666666b68000
+0888888800000000a0aaaaaaaaaaaa0a000000000188810018881000655551111c111556866bb666666bb66666666bbbb66666666bb6bb6666bb66666bb68000
+088888880000000000aaaaaaaaaaaa00000000001877888008888100655555111c1115568666bb6666bb66666666bb66bb6666666b666b66666bb666bb668000
+00888880000000000a1aaaaaaaaaa1a0000000001878880088888100655555111cc1115686666bb66bb666666666b6666bb66666bb666bb66666bb6bb6668000
+00088800000000000aa1111111111aa00000000018888008888881006555555111cc1156866666bbbb6666666666b6666bb66666b66666b666666b6b66668000
+0000800000000000aaa1111aa1111aaa000000000188880088881000655555511ccc11568666666bb66666bbbb66b666bb666666b66666b666666bbb66668000
+0000000000000000aaaa111aaa111aaa00000000001888800881000065555111111c1556866666bbbb6666666666bbbbb666666bbbbbbbbb666666b666668000
+00000000000000000aaaaaaaaaaaaaa000000000000188008810000065511111cc11155686666bb66bb666666666b6bb6666666b6666666b666666b666668000
+00000000000000000aaaaaaaaaaaaaa0000000000000180881000000651111ccc11155568666bb6666bb66666666b66bb66666bb6666666bb66666b666668000
+000000000000000000aa1aaaaaa1aa0000000000000001081000000061111ccc11155556866bb666666bb6666666b666bb6666b666666666b66666b666668000
+0000000000000000a0aaa111111aaa0a00000000000000100000000061ccc1c11155555686bb66666666bb666666b6666bb66bb666666666bb6666b666668000
+0000000000000000000aaaaaaaaaa0000000000000000000000000006cc111111555555686666666666666666666666666666666666666666666666666668000
+00000000000000000a000aaaaaa000a00000000000000000000000006c1111155555555688888888888888888888888888888888888888888888888888888000
+0000000000000000a00a000aa000a00a000000000000000000000000666666666666666600000000000000000000000000000000000000000000000000000000
+__label__
+88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+8888822222288ffffff8888888888888888888888888888888888888888888888888888888888888888228228888ff88ff888222822888888822888888228888
+8888828888288f8888f8888888888888888888888888888888888888888888888888888888888888882288822888ffffff888222822888882282888888222888
+8888822222288f8888f8888888888888888888888888888888888888888888888888888888888888882288822888f8ff8f888222888888228882888888288888
+8888888888888f8888f8888888888888888888888888888888888888888888888888888888888888882288822888ffffff888888222888228882888822288888
+8888828282888f8888f88888888888888888888888888888888888888888888888888888888888888822888228888ffff8888228222888882282888222288888
+8888882828288ffffff88888888888888888888888888888888888888888888888888888888888888882282288888f88f8888228222888888822888222888888
+88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0000000000000000aaaaaaaaaaaaaaaacccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000000000
+0000000000000000aaaaaaaaaaaaaaaacccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000000000
+0000000000000000aaaaaaaaaaaaaaaacccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000000000
+0000000000000000aaaaaaaaaaaaaaaacccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000000000
+0000000000000000aaaaaaaaaaaaaaaacccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000000000
+0000000000000000aaaaaaaaaaaaaaaacccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000000000
+0000000000000000aaaaaaaaaaaaaaaacccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000000000
+0000000000000000aaaaaaaaaaaaaaaacccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc0000000000000000
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc0000000000000000cccccccc0000000000000000cccccccc00000000cccccccc
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc0000000000000000cccccccc0000000000000000cccccccc00000000cccccccc
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc0000000000000000cccccccc0000000000000000cccccccc00000000cccccccc
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc0000000000000000cccccccc0000000000000000cccccccc00000000cccccccc
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc0000000000000000cccccccc0000000000000000cccccccc00000000cccccccc
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc0000000000000000cccccccc0000000000000000cccccccc00000000cccccccc
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc0000000000000000cccccccc0000000000000000cccccccc00000000cccccccc
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc0000000000000000cccccccc0000000000000000cccccccc00000000cccccccc
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc0000000000000000
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc0000000000000000
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc0000000000000000
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc0000000000000000
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc0000000000000000
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc0000000000000000
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc0000000000000000
+00000000aaaaaaaaaaaaaaaa00000000aaaaaaaacccccccc00000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc0000000000000000
+00000000ccccccccaaaaaaaa00000000cccccccccccccccc000000005555555500000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc
+00000000ccccccccaaaaaaaa00000000cccccccccccccccc000000005555555500000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc
+00000000ccccccccaaaaaaaa00000000cccccccccccccccc000000005555555500000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc
+00000000ccccccccaaaaaaaa00000000cccccccccccccccc000000005555555500000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc
+00000000ccccccccaaaaaaaa00000000cccccccccccccccc000000005555555500000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc
+00000000ccccccccaaaaaaaa00000000cccccccccccccccc000000005555555500000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc
+00000000ccccccccaaaaaaaa00000000cccccccccccccccc000000005555555500000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc
+00000000ccccccccaaaaaaaa00000000cccccccccccccccc000000005555555500000000cccccccc00000000cccccccc00000000cccccccc00000000cccccccc
+0000000000000000cccccccc0000000000000000cccccccc00000000777777770000000055555555cccccccccccccccc00000000cccccccc0000000000000000
+0000000000000000cccccccc0000000000000000cccccccc00000000777777770000000055555555cccccccccccccccc00000000cccccccc0000000000000000
+0000000000000000cccccccc0000000000000000cccccccc00000000777777770000000055555555cccccccccccccccc00000000cccccccc0000000000000000
+0000000000000000cccccccc0000000000000000cccccccc00000000777777770000000055555555cccccccccccccccc00000000cccccccc0000000000000000
+0000000000000000cccccccc0000000000000000cccccccc00000000777777770000000055555555cccccccccccccccc00000000cccccccc0000000000000000
+0000000000000000cccccccc0000000000000000cccccccc00000000777777770000000055555555cccccccccccccccc00000000cccccccc0000000000000000
+0000000000000000cccccccc0000000000000000cccccccc00000000777777770000000055555555cccccccccccccccc00000000cccccccc0000000000000000
+0000000000000000cccccccc0000000000000000cccccccc00000000777777770000000055555555cccccccccccccccc00000000cccccccc0000000000000000
+ccccccccccccccccccccccccccccccccccccccccbbbbbbbb55555555777777777777777755555555ccccccccccccccccccccccccccccccccbbbbbbbb77777777
+ccccccccccccccccccccccccccccccccccccccccbbbbbbbb55555555777777777777777755555555ccccccccccccccccccccccccccccccccbbbbbbbb77777777
+ccccccccccccccccccccccccccccccccccccccccbbbbbbbb55555555777777777777777755555555ccccccccccccccccccccccccccccccccbbbbbbbb77777777
+ccccccccccccccccccccccccccccccccccccccccbbbbbbbb55555555777777777777777755555555ccccccccccccccccccccccccccccccccbbbbbbbb77777777
+ccccccccccccccccccccccccccccccccccccccccbbbbbbbb55555555777777777777777755555555ccccccccccccccccccccccccccccccccbbbbbbbb77777777
+ccccccccccccccccccccccccccccccccccccccccbbbbbbbb55555555777777777777777755555555ccccccccccccccccccccccccccccccccbbbbbbbb77777777
+ccccccccccccccccccccccccccccccccccccccccbbbbbbbb55555555777777777777777755555555ccccccccccccccccccccccccccccccccbbbbbbbb77777777
+ccccccccccccccccccccccccccccccccccccccccbbbbbbbb55555555777777777777777755555555ccccccccccccccccccccccccccccccccbbbbbbbb77777777
+5555555533333333cccccccccccccccccccccccc555555557777777777777777777777777777777755555555ccccccccccccccccbbbbbbbb5555555577777777
+5555555533333333cccccccccccccccccccccccc555555557777777777777777777777777777777755555555ccccccccccccccccbbbbbbbb5555555577777777
+5555555533333333cccccccccccccccccccccccc555555557777777777777777777777777777777755555555ccccccccccccccccbbbbbbbb5555555577777777
+5555555533333333cccccccccccccccccccccccc555555557777777777777777777777777777777755555555ccccccccccccccccbbbbbbbb5555555577777777
+5555555533333333cccccccccccccccccccccccc555555557777777777777777777777777777777755555555ccccccccccccccccbbbbbbbb5555555577777777
+5555555533333333cccccccccccccccccccccccc555555557777777777777777777777777777777755555555ccccccccccccccccbbbbbbbb5555555577777777
+5555555533333333cccccccccccccccccccccccc555555557777777777777777777777777777777755555555ccccccccccccccccbbbbbbbb5555555577777777
+5555555533333333cccccccccccccccccccccccc555555557777777777777777777777777777777755555555ccccccccccccccccbbbbbbbb5555555577777777
+7777777755555555bbbbbbbbcccccccc33333333555555557777777777777777777777777777777755555555cccccccccccccccc55555555dddddddddddddddd
+7777777755555555bbbbbbbbcccccccc33333333555555557777777777777777777777777777777755555555cccccccccccccccc55555555dddddddddddddddd
+7777777755555555bbbbbbbbcccccccc33333333555555557777777777777777777777777777777755555555cccccccccccccccc55555555dddddddddddddddd
+7777777755555555bbbbbbbbcccccccc33333333555555557777777777777777777777777777777755555555cccccccccccccccc55555555dddddddddddddddd
+7777777755555555bbbbbbbbcccccccc33333333555555557777777777777777777777777777777755555555cccccccccccccccc55555555dddddddddddddddd
+7777777755555555bbbbbbbbcccccccc33333333555555557777777777777777777777777777777755555555cccccccccccccccc55555555dddddddddddddddd
+7777777755555555bbbbbbbbcccccccc33333333555555557777777777777777777777777777777755555555cccccccccccccccc55555555dddddddddddddddd
+7777777755555555bbbbbbbbcccccccc33333333555555557777777777777777777777777777777755555555cccccccccccccccc55555555dddddddddddddddd
+777777775555555533333333cccccccc55555555777777777777777766666666666666667777777755555555bbbbbbbb3333333355555555dddddddddddddddd
+777777775555555533333333cccccccc55555555777777777777777766666666666666667777777755555555bbbbbbbb3333333355555555dddddddddddddddd
+777777775555555533333333cccccccc55555555777777777777777766666666666666667777777755555555bbbbbbbb3333333355555555dddddddddddddddd
+777777775555555533333333cccccccc55555555777777777777777766666666666666667777777755555555bbbbbbbb3333333355555555dddddddddddddddd
+777777775555555533333333cccccccc55555555777777777777777766666666666666667777777755555555bbbbbbbb3333333355555555dddddddddddddddd
+777777775555555533333333cccccccc55555555777777777777777766666666666666667777777755555555bbbbbbbb3333333355555555dddddddddddddddd
+777777775555555533333333cccccccc55555555777777777777777766666666666666667777777755555555bbbbbbbb3333333355555555dddddddddddddddd
+777777775555555533333333cccccccc55555555777777777777777766666666666666667777777755555555bbbbbbbb3333333355555555dddddddddddddddd
+dddddddd7777777755555555333333335555555577777777666666666666666666666666777777777777777755555555bbbbbbbb55555555dddddddddddddddd
+dddddddd7777777755555555333333335555555577777777666666666666666666666666777777777777777755555555bbbbbbbb55555555dddddddddddddddd
+dddddddd7777777755555555333333335555555577777777666666666666666666666666777777777777777755555555bbbbbbbb55555555dddddddddddddddd
+dddddddd7777777755555555333333335555555577777777666666666666666666666666777777777777777755555555bbbbbbbb55555555dddddddddddddddd
+dddddddd7777777755555555333333335555555577777777666666666666666666666666777777777777777755555555bbbbbbbb55555555dddddddddddddddd
+dddddddd7777777755555555333333335555555577777777666666666666666666666666777777777777777755555555bbbbbbbb55555555dddddddddddddddd
+dddddddd7777777755555555333333335555555577777777666666666666666666666666777777777777777755555555bbbbbbbb55555555dddddddddddddddd
+dddddddd7777777755555555333333335555555577777777666666666666666666666666777777777777777755555555bbbbbbbb55555555dddddddddddddddd
+dddddddddddddddddddddddd55555555000000000000000000000000666666666666666600000000000000000000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd55515555000000000000000000000000666666666666666600000000000000000000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd55171555000000000000000000000000666666666666666600000000000000000000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd51555155000000000000000000000000666666666666666600000000000000000000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd17555715000000000000000000000000666666666666666600000000000000000000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd51555155000000000000000000000000666666666666666600000000000000000000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd55171555000000000000000000000000666666666666666600000000000000000000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd55515555000000000000000000000000666666666666666600000000000000000000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd00000000000000006666666600000000000000006666666600000000666666660000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd00000000000000006666666600000000000000006666666600000000666666660000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd00000000000000006666666600000000000000006666666600000000666666660000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd00000000000000006666666600000000000000006666666600000000666666660000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd00000000000000006666666600000000000000006666666600000000666666660000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd00000000000000006666666600000000000000006666666600000000666666660000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd00000000000000006666666600000000000000006666666600000000666666660000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd00000000000000006666666600000000000000006666666600000000666666660000000055555555dddddddddddddddddddddddd
+dddddddddddddddddddddddd0000000000000000666666660000000000000000666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddddddddddd0000000000000000666666660000000000000000666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddddddddddd0000000000000000666666660000000000000000666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddddddddddd0000000000000000666666660000000000000000666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddddddddddd0000000000000000666666660000000000000000666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddddddddddd0000000000000000666666660000000000000000666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddddddddddd0000000000000000666666660000000000000000666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddddddddddd0000000000000000666666660000000000000000666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddd555555556666666600000000000000000000000066666666666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddd555555556666666600000000000000000000000066666666666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddd555555556666666600000000000000000000000066666666666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddd555555556666666600000000000000000000000066666666666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddd555555556666666600000000000000000000000066666666666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddd555555556666666600000000000000000000000066666666666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddd555555556666666600000000000000000000000066666666666666660000000066666666000000006666666655555555dddddddddddddddd
+dddddddddddddddd555555556666666600000000000000000000000066666666666666660000000066666666000000006666666655555555dddddddddddddddd
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+88888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888888
+
+__map__
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
