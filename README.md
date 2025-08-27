@@ -33,5 +33,5 @@ You control a climber scaling a rocky wall.
 
 ## Play Online
 - [Play on Lexaloffle BBS](https://www.lexaloffle.com/bbs/?tid=151060)  
-- [Play on GitHub Pages](https://alexvarivo.github.io/climb/climbing_game.html)
+- [Play on GitHub Pages](https://alexvarivo.github.io/pico8-climbing-game/)
 
